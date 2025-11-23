@@ -1,6 +1,8 @@
 import math
-import jieba
 import re
+
+import jieba
+
 from astrbot.api import logger
 
 # 扩充jieba词典, 后续补充

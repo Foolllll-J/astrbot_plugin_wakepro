@@ -1,17 +1,20 @@
 import asyncio
-import json
-import time
 import random
+import re
+import time
+from collections import deque
+
 from pydantic import BaseModel, ConfigDict, Field
+
+from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.components import At
-from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star_handler import star_handlers_registry
-from astrbot.api import logger
+
 from .sentiment import Sentiment
 from .similarity import Similarity
 
@@ -55,6 +58,9 @@ class GroupState(BaseModel):
     gid: str
     members: dict[str, MemberState] = Field(default_factory=dict)
     shutup_until: float = 0.0  # 闭嘴到何时
+    bot_msgs: deque = Field(
+        default_factory=lambda: deque(maxlen=5)
+    )  # Bot消息缓存，共5条
 
 
 class StateManager:
@@ -69,19 +75,14 @@ class StateManager:
         return cls._groups[gid]
 
 
-@register(
-    "astrbot_plugin_wakepro",
-    "Zhalslar",
-    "更强大的唤醒增强插件",
-    "v1.1.2",
-)
+@register("astrbot_plugin_wakepro", "Zhalslar", "...", "...")
 class WakeProPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
         self.sent = Sentiment()
+        self.sim = Similarity()
         self.commands = self._get_all_commands()
-
 
     def _get_all_commands(self) -> list[str]:
         """遍历所有注册的处理器获取所有命令"""
@@ -100,7 +101,6 @@ class WakeProPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=99)
     async def on_group_msg(self, event: AstrMessageEvent):
         """主入口"""
-        chain = event.get_messages()
         bid: str = event.get_self_id()
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
@@ -154,13 +154,28 @@ class WakeProPlugin(Star):
 
         # 闭嘴检查
         if g.shutup_until > now:
+            logger.debug(f"Bot处于闭嘴中, 忽略此次{uid}的唤醒")
             event.stop_event()
             return
 
         # 沉默检查（辱骂/人机）
         if not event.is_admin() and member.silence_until > now:
+            logger.debug(f"处于沉默中, 忽略此次{uid}的唤醒")
             event.stop_event()
             return
+
+        # 复读屏蔽
+        if self.conf["block_reread"]:
+            cleaned_msg = re.sub(r"[^a-zA-Z0-9]", "", msg).lower()
+            cleaned_bot_msgs = [
+                re.sub(r"[^a-zA-Z0-9]", "", bmsg).lower() for bmsg in g.bot_msgs
+            ]
+            if cleaned_msg in cleaned_bot_msgs:
+                logger.debug(
+                    f"{uid} 发送了与Bot缓存消息相同的内容（忽略符号和空格），触发复读屏蔽"
+                )
+                event.stop_event()
+                return
 
         # 消息缓存与合并
         if cmd not in self.commands:
@@ -178,21 +193,9 @@ class WakeProPlugin(Star):
                     for e in member.pend:
                         e.stop_event()
                     event.message_str = "。".join(msgs + [event.message_str])
-                    logger.debug(f"已合并{len(member.pend)}条缓存消息：{event.message_str}")
-
-        # 空@回复
-        if (
-            not msg
-            and len(chain) == 1
-            and isinstance(chain[0], At)
-            and str(chain[0].qq) == bid
-        ):
-            if text := await self._get_llm_respond(
-                event, self.conf["empty_mention_pt"]
-            ):
-                await event.send(event.plain_result(text))
-                event.stop_event()
-                return
+                    logger.debug(
+                        f"已合并{len(member.pend)}条缓存消息：{event.message_str}"
+                    )
 
         # 各类唤醒条件
         wake = event.is_at_or_wake_command
@@ -218,9 +221,9 @@ class WakeProPlugin(Star):
 
         # 话题相关性唤醒
         if not wake and self.conf["relevant_wake"]:
-            if bmsgs := await self._get_history_msg(event, count=5):
+            if bmsgs := g.bot_msgs:
                 for bmsg in bmsgs:
-                    simi = Similarity.cosine(msg, bmsg, gid)
+                    simi = self.sim.similarity(gid, msg, bmsg)
                     if simi > self.conf["relevant_wake"]:
                         wake = True
                         reason = f"话题相关性{simi}>{self.conf['relevant_wake']}"
@@ -273,7 +276,7 @@ class WakeProPlugin(Star):
                 silence_sec = shut_th * self.conf["silence_multiple"]
                 g.shutup_until = now + silence_sec
                 reason = f"闭嘴沉默{silence_sec}秒"
-                logger.info(f"[wakepro] 群({gid}){reason}：{msg}")
+                logger.debug(f"[wakepro] 群({gid}){reason}：{msg}")
                 event.stop_event()
                 return
 
@@ -301,75 +304,16 @@ class WakeProPlugin(Star):
 
     @filter.on_decorating_result(priority=20)
     async def on_message(self, event: AstrMessageEvent):
-        """发送消息前，清空请求消息的缓存"""
+        """发送消息前，缓存bot消息，清空用户消息缓存"""
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         result = event.get_result()
         if not gid or not uid or not result:
             return
         g: GroupState = StateManager.get_group(gid)
+        g.bot_msgs.append(result.get_plain_text())
         member = g.members.get(uid)
         if not member:
             return
         async with g.members[uid].lock:
             member.pend.clear()
-
-    async def _get_history_msg(
-        self, event: AstrMessageEvent, role: str = "assistant", count: int | None = 0
-    ) -> list | None:
-        """获取历史消息"""
-        try:
-            umo = event.unified_msg_origin
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
-                umo
-            )
-            if not curr_cid:
-                return None
-
-            conversation = await self.context.conversation_manager.get_conversation(
-                umo, curr_cid
-            )
-            if not conversation:
-                return None
-
-            history = json.loads(conversation.history or "[]")
-            contexts = [
-                record["content"]
-                for record in history
-                if record.get("role") == role and record.get("content")
-            ]
-            return contexts[-count:] if count else contexts
-
-        except Exception as e:
-            logger.error(f"获取历史消息失败：{e}")
-            return None
-
-    async def _get_llm_respond(
-        self, event: AstrMessageEvent, prompt_template: str
-    ) -> str | None:
-        """调用llm回复"""
-        try:
-            umo = event.unified_msg_origin
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
-                umo
-            )
-            conversation = await self.context.conversation_manager.get_conversation(
-                umo, curr_cid
-            )
-            contexts = json.loads(conversation.history)
-
-            personality = self.context.get_using_provider().curr_personality
-            personality_prompt = personality["prompt"] if personality else ""
-
-            format_prompt = prompt_template.format(username=event.get_sender_name())
-
-            llm_response = await self.context.get_using_provider().text_chat(
-                prompt=format_prompt,
-                system_prompt=personality_prompt,
-                contexts=contexts,
-            )
-            return llm_response.completion_text
-
-        except Exception as e:
-            logger.error(f"LLM 调用失败：{e}")
-            return None

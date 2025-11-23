@@ -1,147 +1,128 @@
+# similarity.py
 import math
-import jieba
-from collections import defaultdict, deque
 import re
+from collections import defaultdict, deque
+
+import jieba
 
 
 class Similarity:
-    """按群号隔离的动态话题关联性检测器"""
+    """
+    最终稳定版话题相关性检测
+    - 无漂移
+    - 无相似度通胀
+    - 群号隔离
+    """
 
-    # 基础停用词表
-    STOP = {
-        "的",
-        "了",
-        "在",
-        "是",
-        "和",
-        "与",
-        "或",
-        "这",
-        "那",
-        "我",
-        "你",
-        "他",
-        "她",
-        "它",
-    }
+    def __init__(self,
+                 history_limit: int = 120,
+                 stopwords=None,
+                 bot_template_threshold: int = 2):
+        """
+        :param history_limit: 每个群最大历史窗口大小
+        :param stopwords: 自定义停用词列表
+        :param bot_template_threshold: bot 固定句子长度小于N时弱化权重
+        """
+        self._GROUP_DATA = defaultdict(lambda: {
+            "history": deque(maxlen=history_limit),
+            "idf": defaultdict(int),
+            "total_docs": 0,
+        })
 
-    # 每个群维护自己的状态
-    _GROUP_DATA = defaultdict(
-        lambda: {
-            "cache": deque(maxlen=20),
-            "weights": defaultdict(float),
+        self.stopwords = stopwords or {
+            "的", "了", "吗", "吧", "啊", "哦", "嗯", "恩", "你", "我",
+            "他", "她", "它", "这", "那", "就", "都", "又"
         }
-    )
-    DECAY_FACTOR = 0.95  # 权重衰减因子（全局统一）
+        self.bot_template_threshold = bot_template_threshold
 
-
+    # -------------------------
     # 内部工具
-    @classmethod
-    def _state(cls, group_id: str):
-        """根据群号拿到该群的独立数据"""
-        return cls._GROUP_DATA[group_id]
+    # -------------------------
+    def _tokenize(self, text: str):
+        text = re.sub(r"[^\w\u4e00-\u9fa5]", " ", text)
+        words = jieba.lcut(text)
+        return [w for w in words if w not in self.stopwords and len(w.strip()) > 0]
 
-    @classmethod
-    def _update_topic_cache(cls, words, group_id: str):
-        """更新指定群的话题缓存和权重"""
-        st = cls._state(group_id)
+    def _update_idf(self, group_id: str, tokens: set):
+        """更新 IDF 信息"""
+        data = self._GROUP_DATA[group_id]
+        for t in tokens:
+            data["idf"][t] += 1 # type: ignore
+        data["total_docs"] += 1  # type: ignore
 
-        # 更新缓存
-        for word in words:
-            if (
-                word not in cls.STOP
-                and len(word) > 1
-                and re.match(r"^[\u4e00-\u9fa5]+$", word)
-            ):
-                st["cache"].append(word) # type: ignore
+    def _tfidf_vector(self, group_id: str, tokens: list):
+        """构建稳定的 TF-IDF 向量"""
+        data = self._GROUP_DATA[group_id]
+        total_docs = data["total_docs"] or 1
 
-        # 计算频率
-        freq = defaultdict(int)
-        for w in st["cache"]:
-            freq[w] += 1
+        tf = defaultdict(int)
+        for t in tokens:
+            tf[t] += 1
 
-        # 更新权重
-        for w, cnt in freq.items():
-            decayed = st["weights"].get(w, 0) * cls.DECAY_FACTOR  # type: ignore
-            current = cnt * (1.0 + math.log(len(w) or 1))
-            st["weights"][w] = max(decayed, current)
+        vec = {}
+        for t, c in tf.items():
+            idf = math.log((total_docs + 1) / (data["idf"][t] + 1)) + 1  # type: ignore
+            vec[t] = c * idf
+        return vec
 
-    @classmethod
-    def _extract_keywords(cls, s: str, group_id: str) -> list:
-        """提取关键词并更新指定群的话题缓存"""
-        s = re.sub(r"[^\w\s\u4e00-\u9fa5]", "", s)
-        words = [w for w in jieba.lcut(s) if w.strip() and w not in cls.STOP]
+    def _cosine(self, v1, v2):
+        if not v1 or not v2:
+            return 0.0
 
-        # 合并连续数字/单字
-        merged = []
-        for w in words:
-            if merged and (
-                (w.isdigit() and merged[-1][-1].isdigit())
-                or (len(merged[-1]) == 1 and len(w) == 1)
-            ):
-                merged[-1] += w
-            else:
-                merged.append(w)
-
-        cls._update_topic_cache(merged, group_id)
-        return merged
-
-
-    # 公共 API
-    @classmethod
-    def _tokens(cls, s: str, group_id: str) -> dict[str, float]:
-        """生成带权重的词向量（群内）"""
-        words = cls._extract_keywords(s, group_id)
-        st = cls._state(group_id)
-        tf = defaultdict(float)
-
-        # 一元词
-        for w in words:
-            weight = 1.0 + st["weights"].get(w, 0)  # type: ignore
-            tf[w] += weight
-
-        # 二元词
-        for i in range(len(words) - 1):
-            bigram = words[i] + words[i + 1]
-            tf[bigram] += 1.5
-
-        total = max(sum(tf.values()), 1)
-        return {w: c / total for w, c in tf.items()}
-
-    @classmethod
-    def cosine(cls, a: str, b: str, group_id: str = "default") -> float:
-        """计算同一群内两条文本的相似度"""
-        v1 = cls._tokens(a, group_id)
-        v2 = cls._tokens(b, group_id)
-        all_w = set(v1) | set(v2)
-
+        # 分子
         dot = 0
-        for w in all_w:
-            x, y = v1.get(w, 0), v2.get(w, 0)
-            if x > 0 and y > 0:
-                dot += x * y * (2.0 + cls._state(group_id)["weights"].get(w, 0))  # type: ignore
-            else:
-                dot += x * y
+        for k, v in v1.items():
+            if k in v2:
+                dot += v * v2[k]
 
+        # 分母
         norm1 = math.sqrt(sum(v * v for v in v1.values()))
         norm2 = math.sqrt(sum(v * v for v in v2.values()))
-        raw = dot / (norm1 * norm2 + 1e-8)
-        return 1 / (1 + math.exp(-8 * (raw - 0.6)))
 
-    @classmethod
-    def get_current_topics(cls, group_id: str = "default", top_n: int = 5):
-        """获取指定群当前最重要的 top_n 个话题"""
-        st = cls._state(group_id)
-        return sorted(st["weights"].items(), key=lambda kv: kv[1], reverse=True)[:top_n]  # type: ignore
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot / (norm1 * norm2)
 
+    # -------------------------
+    # 主对外方法
+    # -------------------------
+    def similarity(self, group_id: str, user_msg: str, bot_msgs: list[str]):
+        """
+        对用户消息与 bot 最近N条消息做相似度检测
+        """
+        # 分词
+        user_tokens = self._tokenize(user_msg)
+        if not user_tokens:
+            return 0.0
 
-    # 管理工具（可选）
-    @classmethod
-    def clear_group(cls, group_id: str):
-        """清空某个群的所有话题数据"""
-        cls._GROUP_DATA.pop(group_id, None)
+        # 更新群历史语料
+        history_entry = " ".join(user_tokens)
+        if history_entry:
+            self._GROUP_DATA[group_id]["history"].append(history_entry)  # type: ignore
+            self._update_idf(group_id, set(user_tokens))
 
-    @classmethod
-    def list_groups(cls):
-        """返回当前有数据的群号列表"""
-        return list(cls._GROUP_DATA.keys())
+        # 构建用户向量
+        user_vec = self._tfidf_vector(group_id, user_tokens)
+
+        # 对 bot 每条消息做相似度计算
+        scores = []
+        for bm in bot_msgs:
+            if not bm:
+                continue
+
+            # 去除模板句子影响（如 “好的，我来了”）
+            if len(bm) <= self.bot_template_threshold:
+                continue
+
+            bm_tokens = self._tokenize(bm)
+            if not bm_tokens:
+                continue
+
+            bm_vec = self._tfidf_vector(group_id, bm_tokens)
+            sim = self._cosine(user_vec, bm_vec)
+            scores.append(sim)
+
+        if not scores:
+            return 0.0
+
+        return max(scores)
