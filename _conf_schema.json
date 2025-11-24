@@ -17,7 +17,41 @@
         "type": "list",
         "default": []
     },
-    "wake_cd":{
+    "wake_forbidden_words": {
+        "description": "唤醒屏蔽词",
+        "hint": "如果用户输入的消息包含这些词，则不会唤醒bot(但bot管理员不受影响)",
+        "type": "list",
+        "default": [
+            "政治",
+            "键证",
+            "党"
+        ]
+    },
+    "block_reread": {
+        "description": "屏蔽复读",
+        "hint": "屏蔽其他人对Bot消息的复读， 从而避免Bot被重复的话唤醒",
+        "type": "bool",
+        "default": true
+    },
+    "block_builtin": {
+        "description": "屏蔽内置指令",
+        "hint": "内置指令即指Astrbot自带的命令，如help, tts, llm等，内置指令被屏蔽后不再会唤醒bot(但bot管理员不受影响), 从而让你的bot更像真人",
+        "type": "bool",
+        "default": false
+    },
+    "block_prefix_cmd": {
+        "description": "禁止使用前缀触发指令",
+        "hint": "开启后，即使用户使用前缀，也无法触发指令，但llm不受影响",
+        "type": "bool",
+        "default": false
+    },
+    "block_prefix_llm": {
+        "description": "禁止使用前缀唤醒LLM",
+        "hint": "开启后，即使用户使用前缀，也无法唤醒llm，但指令不受影响",
+        "type": "bool",
+        "default": false
+    },
+    "wake_cd": {
         "description": "唤醒CD(秒)",
         "hint": "唤醒bot的CD(冷却时间)，每个成员单独计CD，bot处于唤醒CD时拒收该成员的一切消息，此CD优先级比其他CD高，建议别设太大，会影响挂起和唤醒延长的效果。另外如果你开有多个bot，建议CD宁可设得很小也不要设为0，这样能防止同一个群两个bot一起回复",
         "type": "float",
@@ -33,7 +67,7 @@
         "description": "唤醒延长（秒）",
         "hint": "bot被唤醒后的多长时间内，持续保持唤醒状态(每个用户单独计时)。 设为0时关闭检测",
         "type": "float",
-        "default": 3.0
+        "default": 5.0
     },
     "mention_wake": {
         "description": "提及唤醒的昵称",
@@ -59,6 +93,12 @@
         "type": "float",
         "default": 0.6
     },
+    "prob_wake": {
+        "description": "兜底唤醒概率",
+        "hint": "上述所有唤醒机制都没能唤醒bot时，最后会按照此概率尝试唤醒bot(相当于Astrbot框架中的主动唤醒概率)，概率越大越容易唤醒，建议设置得非常小",
+        "type": "float",
+        "default": 0.0005
+    },
     "shutup": {
         "description": "闭嘴检测阈值",
         "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。 低阈值更容易让bot闭嘴。 设为0时关闭检测",
@@ -82,33 +122,5 @@
         "hint": "触发bot沉默时的阈值（0~1） * 沉默时间倍数 = 沉默时间",
         "type": "float",
         "default": 500
-    },
-    "prob_wake": {
-        "description": "兜底唤醒概率",
-        "hint": "上述所有唤醒机制都没能唤醒bot时，最后会按照此概率尝试唤醒bot(相当于Astrbot框架中的主动唤醒概率)，概率越大越容易唤醒，建议设置得非常小",
-        "type": "float",
-        "default": 0.0005
-    },
-    "wake_forbidden_words":{
-        "description": "唤醒词屏蔽词",
-        "hint": "唤醒词屏蔽词，如果用户输入的唤醒词包含这些词，则不会唤醒bot(但bot管理员不受影响)",
-        "type": "list",
-        "default": [
-            "政治",
-            "键证",
-            "党"
-        ]
-    },
-    "block_builtin":{
-        "description": "屏蔽内置指令",
-        "hint": "内置指令即指Astrbot自带的命令，如help, tts, llm等，内置指令被屏蔽后不再会唤醒bot(但bot管理员不受影响), 从而让你的bot更像真人",
-        "type": "bool",
-        "default": false
-    },
-    "block_reread":{
-        "description": "屏蔽复读",
-        "hint": "屏蔽其他人对Bot消息的复读， 从而避免Bot被重复的话唤醒",
-        "type": "bool",
-        "default": true
     }
 }
