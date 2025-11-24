@@ -1,3 +1,5 @@
+# \astrbot\core\sentiment.py
+
 import math
 import re
 

@@ -16,6 +16,7 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
+from .interest import Interest
 from .sentiment import Sentiment
 from .similarity import Similarity
 
@@ -87,6 +88,11 @@ class WakeProPlugin(Star):
         self.sim = Similarity()
         self.commands = self._get_all_commands()
         self.wake_prefix = self.context.get_config().get("wake_prefix")
+        interest_words_str: list[str] = self.conf["interest_words_str"]
+        interest_words_list: list[list[str]] = [
+            words_str.split() for words_str in interest_words_str
+        ]
+        self.interest = Interest(interest_words_list)
 
     def _get_all_commands(self) -> list[str]:
         """遍历所有注册的处理器获取所有命令"""
@@ -234,6 +240,7 @@ class WakeProPlugin(Star):
                 # 通过所有过滤，执行唤醒
                 wake = True
                 reason = "prefix"
+                logger.debug(f"{uid} 触发前缀唤醒：{prefix}")
                 break
 
         # At唤醒
@@ -241,10 +248,12 @@ class WakeProPlugin(Star):
             if isinstance(seg, At) and str(seg.qq) == bid:
                 wake = True
                 reason = "at"
+                logger.debug(f"{uid} 触发At唤醒")
                 break
             elif isinstance(seg, Reply) and str(seg.sender_id) == bid:
                 wake = True
                 reason = "reply"
+                logger.debug(f"{uid} 触发引用回复唤醒")
                 break
 
         # 提及唤醒
@@ -254,6 +263,7 @@ class WakeProPlugin(Star):
                 if n and n in msg:
                     wake = True
                     reason = "mention"
+                    logger.debug(f"{uid} 触发提及唤醒：{n}")
                     break
 
         # 唤醒延长（如果已经处于唤醒状态且在 wake_extend 秒内，每个用户单独延长唤醒时间）
@@ -265,34 +275,53 @@ class WakeProPlugin(Star):
         ):
             wake = True
             reason = "prolong"
+            logger.debug(
+                f"{uid} 唤醒延长, 时间为上次llm回复后的第{now - member.last_reply}秒"
+            )
 
         # 话题相关性唤醒
         if not wake and self.conf["relevant_wake"] and g.bot_msgs:
             simi = self.sim.similarity(
                 group_id=gid, user_msg=msg, bot_msgs=list(g.bot_msgs)
             )
-            logger.debug(f"相关度{simi}: {msg[:10]}...")
+            logger.debug(f"话题相关度:{simi}")
             if simi > self.conf["relevant_wake"]:
                 wake = True
                 reason = "similar"
+                logger.debug(f"{uid} 触发话题相关性唤醒, 相关度：{simi}")
 
         # 答疑唤醒
         if (
             not wake
             and self.conf["ask_wake"]
-            and self.sent.ask(msg) > self.conf["ask_wake"]
+            and (ask_th := self.sent.ask(msg)) > self.conf["ask_wake"]
         ):
             wake = True
             reason = "ask"
+            logger.debug(f"{uid} 触发答疑唤醒, 疑问值：{ask_th}")
 
         # 无聊唤醒
         if (
             not wake
             and self.conf["bored_wake"]
-            and self.sent.bored(msg) > self.conf["bored_wake"]
+            and (bored_th := self.sent.bored(msg)) > self.conf["bored_wake"]
         ):
             wake = True
             reason = "bored"
+            logger.debug(f"{uid} 触发无聊唤醒, 无聊值：{bored_th}")
+
+        # 兴趣唤醒
+        if (
+            not wake
+            and self.conf["interest_wake"]
+
+        ):
+            interest_th = self.interest.calc_interest(msg)
+            logger.debug(f"兴趣值：{interest_th}")
+            if interest_th > self.conf["interest_wake"]:
+                wake = True
+                reason = "interest"
+                logger.debug(f"{uid} 触发兴趣唤醒, 兴趣值：{interest_th}")
 
         # 概率唤醒
         if (
@@ -302,6 +331,7 @@ class WakeProPlugin(Star):
         ):
             wake = True
             reason = "prob"
+            logger.debug(f"{uid} 触发概率唤醒")
 
         # 触发唤醒
         if wake:
@@ -316,8 +346,7 @@ class WakeProPlugin(Star):
             member.last_wake = now
             # 记录原因
             member.last_wake_reason = reason
-            # 记录日志
-            logger.debug(f"群({gid})触发唤醒; 唤醒方式：{reason}")
+
 
         # 闭嘴机制(对当前群聊闭嘴)
         if self.conf["shutup"]:

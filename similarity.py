@@ -1,3 +1,5 @@
+# \astrbot\core\similarity.py
+
 import math
 import re
 from collections import defaultdict, deque
