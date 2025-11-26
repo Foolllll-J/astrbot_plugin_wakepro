@@ -166,9 +166,9 @@ class WakeProPlugin(Star):
 
         # 复读屏蔽
         if self.conf["block_reread"]:
-            cleaned_msg = re.sub(r"[^\w\u4e00-\u9fff]", "", msg).lower()
+            cleaned_msg = re.sub(r"[^a-zA-Z0-9]", "", msg).lower()
             cleaned_bot_msgs = [
-                re.sub(r"[^\w\u4e00-\u9fff]", "", bmsg).lower() for bmsg in g.bot_msgs
+                re.sub(r"[^a-zA-Z0-9]", "", bmsg).lower() for bmsg in g.bot_msgs
             ]
             if cleaned_msg in cleaned_bot_msgs:
                 logger.debug(
@@ -220,14 +220,14 @@ class WakeProPlugin(Star):
             reason = "唤醒延长"
 
         # 话题相关性唤醒
-        if not wake and self.conf["relevant_wake"] and g.bot_msgs:
-            simi = self.sim.similarity(
-                group_id=gid, user_msg=msg, bot_msgs=list(g.bot_msgs)
-            )
-            logger.debug(f"相关度{simi}: {msg[:5]}...")
-            if simi > self.conf["relevant_wake"]:
-                wake = True
-                reason = f"话题相关性{simi}>{self.conf['relevant_wake']}"
+        if not wake and self.conf["relevant_wake"]:
+            if bmsgs := g.bot_msgs:
+                for bmsg in bmsgs:
+                    simi = self.sim.similarity(gid, msg, bmsg)
+                    if simi > self.conf["relevant_wake"]:
+                        wake = True
+                        reason = f"话题相关性{simi}>{self.conf['relevant_wake']}"
+                        break
 
         # 答疑唤醒
         if (
