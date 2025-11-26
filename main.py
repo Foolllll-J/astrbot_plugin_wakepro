@@ -12,58 +12,56 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.api import logger
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from .sentiment import Sentiment
 from .similarity import Similarity
 
-# 内置指令文本
+
+# ==================== 常量定义 ====================
+
+# AstrBot 内置指令列表
 BUILT_CMDS = [
-    "llm",
-    "t2i",
-    "tts",
-    "sid",
-    "op",
-    "wl",
-    "dashboard_update",
-    "alter_cmd",
-    "provider",
-    "model",
-    "plugin",
-    "plugin ls",
-    "new",
-    "switch",
-    "rename",
-    "del",
-    "reset",
-    "history",
-    "persona",
-    "tool ls",
-    "key",
-    "websearch",
+    "llm", "t2i", "tts", "sid", "op", "wl",
+    "dashboard_update", "alter_cmd", "provider", "model",
+    "plugin", "plugin ls", "new", "switch", "rename",
+    "del", "reset", "history", "persona", "tool ls",
+    "key", "websearch",
 ]
 
+# 合并延迟期间最多合并的消息数量（防止轰炸攻击）
+MAX_MERGE_MESSAGES = 10
+
+
+# ==================== 数据模型 ====================
 
 class MemberState(BaseModel):
-    uid: str
-    silence_until: float = 0.0  # 沉默到何时
-    last_wake: float = 0.0  # 最后唤醒bot的时间
-    pend: list[AstrMessageEvent] = Field(default_factory=list)  # 事件缓存
-    lock: asyncio.Lock = Field(default_factory=asyncio.Lock)
+    """群成员状态"""
+    uid: str                                              # 用户ID
+    silence_until: float = 0.0                            # 沉默截止时间（时间戳）
+    last_request: float = 0.0                             # 最后一次发送LLM请求的时间（时间戳）
+    last_response: float = 0.0                            # 最后一次LLM响应的时间（时间戳）
+    lock: asyncio.Lock = Field(default_factory=asyncio.Lock)  # 异步锁
+    in_merging: bool = False                              # 是否正在消息合并状态中
+    
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class GroupState(BaseModel):
-    gid: str
-    members: dict[str, MemberState] = Field(default_factory=dict)
-    shutup_until: float = 0.0  # 闭嘴到何时
+    """群组状态"""
+    gid: str                                              # 群组ID
+    members: dict[str, MemberState] = Field(default_factory=dict)  # 成员状态字典
+    shutup_until: float = 0.0                             # 群组闭嘴截止时间（时间戳）
 
 
 class StateManager:
-    """内存状态管理"""
-
+    """状态管理器 - 管理所有群组和成员的状态"""
+    
     _groups: dict[str, GroupState] = {}
-
+    
     @classmethod
     def get_group(cls, gid: str) -> GroupState:
+        """获取或创建群组状态"""
         if gid not in cls._groups:
             cls._groups[gid] = GroupState(gid=gid)
         return cls._groups[gid]
@@ -71,20 +69,33 @@ class StateManager:
 
 @register(
     "astrbot_plugin_wakepro",
-    "Zhalslar",
+    "Zhalslar&Foolllll",
     "更强大的唤醒增强插件",
-    "v1.1.2",
+    "v1.1.4",
 )
 class WakeProPlugin(Star):
+    """
+    WakePro 插件主类
+    
+    功能分层：
+    1. 全局屏蔽：黑白名单（影响所有消息）
+    2. 指令屏蔽：内置指令屏蔽（只对内置指令生效）
+    3. LLM对话：唤醒机制、消息合并、防护等（只对LLM对话生效）
+    """
+    
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
         self.sent = Sentiment()
         self.commands = self._get_all_commands()
 
-
     def _get_all_commands(self) -> list[str]:
-        """遍历所有注册的处理器获取所有命令"""
+        """
+        获取所有已注册的插件指令
+        
+        Returns:
+            list[str]: 指令名称列表
+        """
         commands = []
         for handler in star_handlers_registry:
             for fl in handler.event_filters:
@@ -94,12 +105,23 @@ class WakeProPlugin(Star):
                 elif isinstance(fl, CommandGroupFilter):
                     commands.append(fl.group_name)
                     break
-        logger.debug(f"插件的指令列表：{commands}")
+        logger.debug(f"插件指令列表：{commands}")
         return commands
 
+    # ==================== 核心事件处理 ====================
+    
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=99)
     async def on_group_msg(self, event: AstrMessageEvent):
-        """主入口"""
+        """
+        群消息处理主入口
+        
+        处理流程：
+        1. 全局屏蔽检查（黑白名单）
+        2. 内置指令屏蔽检查
+        3. 插件指令过滤
+        4. LLM对话相关检查（闭嘴、沉默、唤醒、消息合并等）
+        """
+        # 提取基本信息
         chain = event.get_messages()
         bid: str = event.get_self_id()
         gid: str = event.get_group_id()
@@ -107,98 +129,88 @@ class WakeProPlugin(Star):
         msg: str = event.message_str
         g: GroupState = StateManager.get_group(gid)
 
-        # 只处理文本
+        # 只处理文本消息
         if not msg:
             return
         cmd = msg.split(" ", 1)[0]
 
-        # 群聊黑白名单 / 用户黑名单
+        # ========== 第一层：全局屏蔽检查（对所有消息生效）==========
+        
+        # 过滤 bot 自己的消息
         if uid == bid:
             return
+        
+        # 群聊白名单检查
         if self.conf["group_whitelist"] and gid not in self.conf["group_whitelist"]:
             return
+        
+        # 群聊黑名单检查
         if gid in self.conf["group_blacklist"] and not event.is_admin():
             event.stop_event()
             return
+        
+        # 用户黑名单检查
         if uid in self.conf.get("user_blacklist", []):
             event.stop_event()
             return
 
-        # 更新成员状态
-        if uid not in g.members:
-            g.members[uid] = MemberState(uid=uid)
-
-        member = g.members[uid]
-        now = time.time()
-
-        # 唤醒CD检查
-        if now - g.members[uid].last_wake < self.conf["wake_cd"]:
-            logger.debug(f"{uid} 处于唤醒CD中, 忽略此次唤醒")
-            event.stop_event()
-            return
-
-        # 唤醒违禁词检查
-        if self.conf["wake_forbidden_words"]:
-            for word in self.conf["wake_forbidden_words"]:
-                if not event.is_admin() and word in event.message_str:
-                    logger.debug(f"{uid} 消息中含有唤醒屏蔽词, 忽略此次唤醒")
-                    event.stop_event()
-                    return
-
-        # 屏蔽内置指令
+        # ========== 第二层：内置指令屏蔽（只对内置指令生效）==========
+        
         if self.conf["block_builtin"]:
             if not event.is_admin() and event.message_str in BUILT_CMDS:
-                logger.debug(f"{uid} 触发内置指令, 忽略此次唤醒")
+                logger.debug(f"用户({uid})触发内置指令，已屏蔽")
                 event.stop_event()
                 return
+        
+        # ========== 第三层：插件指令过滤（跳过所有插件指令）==========
+        
+        # 如果是任何插件的指令，直接放行，不做任何处理
+        if cmd in self.commands:
+            return
 
-        # 闭嘴检查
+        # ========== 第四层：LLM对话相关处理 ==========
+        
+        # 初始化或获取用户状态
+        if uid not in g.members:
+            g.members[uid] = MemberState(uid=uid)
+        member = g.members[uid]
+        now = time.time()
+        
+        # 如果用户正在消息合并状态，跳过所有检查（由 session_waiter 处理）
+        if member.in_merging:
+            logger.debug(f"用户({uid})处于消息合并状态，进入session_waiter")
+            return
+
+        # --- 防护机制检查 ---
+        
+        # 群组闭嘴检查
         if g.shutup_until > now:
             event.stop_event()
             return
 
-        # 沉默检查（辱骂/人机）
+        # 沉默检查
         if not event.is_admin() and member.silence_until > now:
             event.stop_event()
             return
 
-        # 消息缓存与合并
-        if cmd not in self.commands:
-            event.set_extra("orig_message", event.message_str)
-            event.set_extra("timestamp", now)
-            async with member.lock:
-                if (
-                    member.pend
-                    and now - member.pend[-1].get_extra("timestamp")  # type: ignore
-                    < self.conf["pend_cd"]
-                ):
-                    msgs: list[str] = [
-                        e.get_extra("orig_message") or "" for e in member.pend
-                    ]  # type: ignore
-                    for e in member.pend:
-                        e.stop_event()
-                    event.message_str = "。".join(msgs + [event.message_str])
-                    logger.debug(f"已合并{len(member.pend)}条缓存消息：{event.message_str}")
-
-        # 空@回复
-        if (
-            not msg
-            and len(chain) == 1
-            and isinstance(chain[0], At)
-            and str(chain[0].qq) == bid
-        ):
-            if text := await self._get_llm_respond(
-                event, self.conf["empty_mention_pt"]
-            ):
-                await event.send(event.plain_result(text))
+        # 请求CD检查：最高优先级，防止消息轰炸
+        request_cd_value = self.conf.get("request_cd", 0)
+        if request_cd_value > 0:
+            time_since_last_request = now - member.last_request
+            if time_since_last_request < request_cd_value:
+                logger.debug(
+                    f"用户({uid})处于请求CD中"
+                    f"({time_since_last_request:.1f}s < {request_cd_value}s)"
+                )
                 event.stop_event()
                 return
 
-        # 各类唤醒条件
-        wake = event.is_at_or_wake_command
-        reason = "at_or_cmd"
+        # --- 唤醒条件判断 ---
+        
+        wake = event.is_at_or_wake_command  # 是否唤醒
+        reason = "at_or_cmd"                 # 唤醒原因
 
-        # 提及唤醒
+        # 1. 提及唤醒：消息中包含特定关键词
         if not wake and self.conf["mention_wake"]:
             names = [n for n in self.conf["mention_wake"] if n]
             for n in names:
@@ -207,128 +219,220 @@ class WakeProPlugin(Star):
                     reason = f"提及唤醒({n})"
                     break
 
-        # 唤醒延长（如果已经处于唤醒状态且在 wake_extend 秒内，每个用户单独延长唤醒时间）
+        # 2. 唤醒延长：在上次LLM响应后的延长窗口内
         if (
             not wake
             and self.conf["wake_extend"]
-            and (now - member.last_wake) <= int(self.conf["wake_extend"] or 0)
+            and (now - member.last_response) <= int(self.conf["wake_extend"] or 0)
         ):
             wake = True
             reason = "唤醒延长"
 
-        # 话题相关性唤醒
+        # 3. 话题相关性唤醒：与最近对话内容相关
         if not wake and self.conf["relevant_wake"]:
             if bmsgs := await self._get_history_msg(event, count=5):
                 for bmsg in bmsgs:
                     simi = Similarity.cosine(msg, bmsg, gid)
                     if simi > self.conf["relevant_wake"]:
                         wake = True
-                        reason = f"话题相关性{simi}>{self.conf['relevant_wake']}"
+                        reason = f"话题相关性{simi:.2f}>{self.conf['relevant_wake']}"
                         break
 
-        # 答疑唤醒
-        if (
-            not wake
-            and self.conf["ask_wake"]
-            and self.sent.ask(msg) > self.conf["ask_wake"]
-        ):
-            wake = True
-            reason = "答疑唤醒"
+        # 4. 答疑唤醒：检测到提问意图
+        if not wake and self.conf["ask_wake"]:
+            if self.sent.ask(msg) > self.conf["ask_wake"]:
+                wake = True
+                reason = "答疑唤醒"
 
-        # 无聊唤醒
-        if (
-            not wake
-            and self.conf["bored_wake"]
-            and self.sent.bored(msg) > self.conf["bored_wake"]
-        ):
-            wake = True
-            reason = "无聊唤醒"
+        # 5. 无聊唤醒：检测到无聊/寻求陪伴的意图
+        if not wake and self.conf["bored_wake"]:
+            if self.sent.bored(msg) > self.conf["bored_wake"]:
+                wake = True
+                reason = "无聊唤醒"
 
-        # 概率唤醒
-        if (
-            not wake
-            and self.conf["prob_wake"]
-            and random.random() < self.conf["prob_wake"]
-        ):
-            wake = True
-            reason = "概率唤醒"
+        # 6. 概率唤醒：随机唤醒
+        if not wake and self.conf["prob_wake"]:
+            if random.random() < self.conf["prob_wake"]:
+                wake = True
+                reason = "概率唤醒"
 
-        # 触发唤醒
+        # 违禁词检查
+        if self.conf["wake_forbidden_words"]:
+            for word in self.conf["wake_forbidden_words"]:
+                if not event.is_admin() and word in event.message_str:
+                    logger.debug(f"用户({uid})消息含违禁词：{word}")
+                    event.stop_event()
+                    return
+
+        # --- 触发唤醒 ---
+        
         if wake:
-            # 缓存消息
-            if cmd not in self.commands:
-                member.pend.append(event)
-                logger.debug(f"已添加event到缓存：{len(member.pend)}")
-            # # 记录唤醒时间
-            member.last_wake = now
-            # 触发唤醒
             event.is_at_or_wake_command = True
-            # 记录日志
-            logger.info(f"[wakepro] 群({gid}){reason}：{msg}")
+            logger.info(f"群({gid})用户({uid}) {reason}：{msg[:50]}")
+            
+            # 记录请求时间（在即将发送请求前）
+            member.last_request = now
+            
+            # 消息合并处理
+            if self.conf["merge_delay"] and self.conf["merge_delay"] > 0:
+                if not member.in_merging:
+                    member.in_merging = True
+                    try:
+                        await self._handle_message_merge(event, gid, uid, member, now)
+                    finally:
+                        member.in_merging = False
+                else:
+                    logger.debug(f"用户({uid})已在消息合并状态，跳过")
 
-        # 闭嘴机制(对当前群聊闭嘴)
+        # --- 沉默机制触发检测 ---
+        
+        # 闭嘴机制：针对整个群组
         if self.conf["shutup"]:
             shut_th = self.sent.shut(msg)
             if shut_th > self.conf["shutup"]:
                 silence_sec = shut_th * self.conf["silence_multiple"]
                 g.shutup_until = now + silence_sec
-                reason = f"闭嘴沉默{silence_sec}秒"
-                logger.info(f"[wakepro] 群({gid}){reason}：{msg}")
+                logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
                 event.stop_event()
                 return
 
-        # 辱骂沉默机制(对单个用户沉默)
+        # 辱骂沉默机制：针对单个用户
         if self.conf["insult"]:
             insult_th = self.sent.insult(msg)
             if insult_th > self.conf["insult"]:
                 silence_sec = insult_th * self.conf["silence_multiple"]
                 member.silence_until = now + silence_sec
-                reason = f"辱骂沉默{silence_sec}秒"
-                logger.info(f"[wakepro] 群({gid})用户({uid}){reason}：{msg}")
-                # event.stop_event() 本轮对话不沉默，方便回怼
+                logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒")
+                # 注意：本轮对话不沉默，允许bot回怼
                 return
 
-        # AI沉默机制(对单个用户沉默)
+        # AI检测沉默机制：针对单个用户
         if self.conf["ai"]:
             ai_th = self.sent.is_ai(msg)
             if ai_th > self.conf["ai"]:
                 silence_sec = ai_th * self.conf["silence_multiple"]
                 member.silence_until = now + silence_sec
-                reason = f"AI沉默{silence_sec}秒"
-                logger.info(f"[wakepro] 群({gid})用户({uid}){reason}：{msg}")
+                logger.info(f"用户({uid})触发AI检测沉默{silence_sec:.1f}秒")
                 event.stop_event()
                 return
 
-    @filter.on_decorating_result(priority=20)
-    async def on_message(self, event: AstrMessageEvent):
-        """发送消息前，清空请求消息的缓存"""
+    # ==================== 消息合并处理 ====================
+    
+    async def _handle_message_merge(
+        self,
+        event: AstrMessageEvent,
+        gid: str,
+        uid: str,
+        member: MemberState,
+        now: float
+    ):
+        """消息合并处理"""
+        message_buffer = [event.message_str]
+        first_event = event
+        
+        @session_waiter(timeout=self.conf["merge_delay"], record_history_chains=False)
+        async def collect_messages(controller: SessionController, ev: AstrMessageEvent):
+            """收集后续消息"""
+            nonlocal message_buffer
+            
+            # 只收集同一用户的消息
+            if ev.get_sender_id() != uid:
+                logger.debug(f"合并：跳过其他用户({ev.get_sender_id()})的消息")
+                return
+            
+            # 只收集同一群组的消息
+            if ev.get_group_id() != gid:
+                logger.debug(f"合并：跳过其他群组的消息")
+                return
+            
+            # 防止重复处理第一条消息
+            if len(message_buffer) == 1 and ev.message_str == message_buffer[0]:
+                logger.debug(f"合并：跳过重复的第一条消息")
+                controller.keep(timeout=self.conf["merge_delay"], reset_timeout=True)
+                return
+            
+            # 消息数量限制（防止轰炸攻击）
+            if len(message_buffer) >= MAX_MERGE_MESSAGES:
+                logger.warning(
+                    f"合并：用户({uid})消息数量达到上限({MAX_MERGE_MESSAGES})，"
+                    f"强制结束合并"
+                )
+                controller.stop()
+                return
+            
+            request_cd = self.conf.get("request_cd", 0)
+            if request_cd > 0:
+                time_since_last_request = time.time() - member.last_request
+                if time_since_last_request < request_cd:
+                    logger.debug(
+                        f"合并：消息间隔过短，请求CD阻止"
+                        f"({time_since_last_request:.1f}s < {request_cd}s)"
+                    )
+                    ev.stop_event()
+                    return  # 不合并，也不重置超时
+            
+            # 收集消息
+            message_buffer.append(ev.message_str)
+            logger.debug(f"合并：收集用户({uid})消息[{len(message_buffer)}]: {ev.message_str[:50]}")
+            
+            # 阻止这条消息的默认处理（避免重复调用LLM）
+            ev.stop_event()
+            
+            # 重置超时，继续等待
+            controller.keep(timeout=self.conf["merge_delay"], reset_timeout=True)
+        
+        try:
+            await collect_messages(event)
+            logger.debug(f"合并：会话被停止")
+        except TimeoutError:
+            # 超时：合并消息并继续处理
+            if len(message_buffer) > 1:
+                merged_msg = " ".join(message_buffer)  # 用空格连接
+                first_event.message_str = merged_msg
+                logger.info(
+                    f"合并：用户({uid})合并了{len(message_buffer)}条消息 "
+                    f"({merged_msg[:100]}...)"
+                )
+            # 不 stop_event，让合并后的消息继续传递给 LLM
+
+    # ==================== 事件钩子 ====================
+    
+    @filter.on_llm_response(priority=20)
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        """LLM响应后的钩子"""
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
-        result = event.get_result()
-        if not gid or not uid or not result:
+        
+        if not gid or not uid:
             return
+            
         g: GroupState = StateManager.get_group(gid)
         member = g.members.get(uid)
+        
         if not member:
             return
-        async with g.members[uid].lock:
-            member.pend.clear()
+        
+        member.last_response = time.time()
+        logger.debug(f"LLM响应完成，更新用户({uid})的last_response时间")
 
+    # ==================== 辅助方法 ====================
+    
     async def _get_history_msg(
-        self, event: AstrMessageEvent, role: str = "assistant", count: int | None = 0
+        self,
+        event: AstrMessageEvent,
+        role: str = "assistant",
+        count: int | None = 0
     ) -> list | None:
         """获取历史消息"""
         try:
             umo = event.unified_msg_origin
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
-                umo
-            )
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+            
             if not curr_cid:
                 return None
 
-            conversation = await self.context.conversation_manager.get_conversation(
-                umo, curr_cid
-            )
+            conversation = await self.context.conversation_manager.get_conversation(umo, curr_cid)
+            
             if not conversation:
                 return None
 
@@ -338,6 +442,7 @@ class WakeProPlugin(Star):
                 for record in history
                 if record.get("role") == role and record.get("content")
             ]
+            
             return contexts[-count:] if count else contexts
 
         except Exception as e:
@@ -345,17 +450,15 @@ class WakeProPlugin(Star):
             return None
 
     async def _get_llm_respond(
-        self, event: AstrMessageEvent, prompt_template: str
+        self,
+        event: AstrMessageEvent,
+        prompt_template: str
     ) -> str | None:
-        """调用llm回复"""
+        """调用 LLM 获取回复"""
         try:
             umo = event.unified_msg_origin
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
-                umo
-            )
-            conversation = await self.context.conversation_manager.get_conversation(
-                umo, curr_cid
-            )
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+            conversation = await self.context.conversation_manager.get_conversation(umo, curr_cid)
             contexts = json.loads(conversation.history)
 
             personality = self.context.get_using_provider().curr_personality
@@ -368,8 +471,9 @@ class WakeProPlugin(Star):
                 system_prompt=personality_prompt,
                 contexts=contexts,
             )
+            
             return llm_response.completion_text
 
         except Exception as e:
-            logger.error(f"LLM 调用失败：{e}")
+            logger.error(f"LLM调用失败：{e}")
             return None
