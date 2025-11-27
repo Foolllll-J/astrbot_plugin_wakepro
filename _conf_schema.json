@@ -110,5 +110,11 @@
         "hint": "内置指令即指Astrbot自带的命令，如help, tts, llm等，内置指令被屏蔽后不再会唤醒bot(但bot管理员不受影响), 从而让你的bot更像真人",
         "type": "bool",
         "default": false
+    },
+    "ignore_commands": {
+        "description": "忽略的插件指令",
+        "hint": "手动指定需要忽略的插件指令列表（不含前缀），用于处理别名等无法自动识别的情况。",
+        "type": "list",
+        "default": []
     }
 }

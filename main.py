@@ -26,7 +26,7 @@ BUILT_CMDS = [
     "dashboard_update", "alter_cmd", "provider", "model",
     "plugin", "plugin ls", "new", "switch", "rename",
     "del", "reset", "history", "persona", "tool ls",
-    "key", "websearch",
+    "key", "websearch", "help",
 ]
 
 # 合并延迟期间最多合并的消息数量（防止轰炸攻击）
@@ -166,6 +166,13 @@ class WakeProPlugin(Star):
         
         # 如果是任何插件的指令，直接放行，不做任何处理
         if cmd in self.commands:
+            logger.debug(f"检测到插件指令({cmd})，跳过wakepro处理")
+            return
+        
+        # 手动配置的忽略指令（用于处理别名等无法自动识别的情况）
+        ignore_commands = self.conf.get("ignore_commands", [])
+        if cmd in ignore_commands:
+            logger.debug(f"检测到配置的忽略指令({cmd})，跳过wakepro处理")
             return
 
         # ========== 第四层：LLM对话相关处理 ==========
