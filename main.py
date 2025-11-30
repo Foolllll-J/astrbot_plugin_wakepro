@@ -71,55 +71,37 @@ class StateManager:
     "astrbot_plugin_wakepro",
     "Zhalslar&Foolllll",
     "更强大的唤醒增强插件",
-    "v1.1.4",
+    "v1.1.7",
 )
 class WakeProPlugin(Star):
     """
     WakePro 插件主类
     
-    功能分层：
-    1. 全局屏蔽：黑白名单（影响所有消息）
-    2. 指令屏蔽：内置指令屏蔽（只对内置指令生效）
-    3. LLM对话：唤醒机制、消息合并、防护等（只对LLM对话生效）
+    设计流程:
+    1. 消息级别(on_group_msg): 只处理黑白名单、内置指令屏蔽、唤醒判断
+    2. LLM请求级别(on_llm_request): 处理所有检测和防护
+       ├── 沉默触发检测(辱骂、闭嘴、AI检测)
+       ├── 防护机制(沉默状态、闭嘴状态、请求CD)
+       └── 消息合并
     """
     
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
         self.sent = Sentiment()
-        self.commands = self._get_all_commands()
 
-    def _get_all_commands(self) -> list[str]:
-        """
-        获取所有已注册的插件指令
-        
-        Returns:
-            list[str]: 指令名称列表
-        """
-        commands = []
-        for handler in star_handlers_registry:
-            for fl in handler.event_filters:
-                if isinstance(fl, CommandFilter):
-                    commands.append(fl.command_name)
-                    break
-                elif isinstance(fl, CommandGroupFilter):
-                    commands.append(fl.group_name)
-                    break
-        logger.debug(f"插件指令列表：{commands}")
-        return commands
-
-    # ==================== 核心事件处理 ====================
+    # ==================== 消息级别: 仅基础检查 ====================
     
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=99)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1)
     async def on_group_msg(self, event: AstrMessageEvent):
         """
-        群消息处理主入口
-        
-        处理流程：
-        1. 全局屏蔽检查（黑白名单）
-        2. 内置指令屏蔽检查
-        3. 插件指令过滤
-        4. LLM对话相关检查（闭嘴、沉默、唤醒、消息合并等）
+        【第一层: 消息级别 - 基础检查和唤醒判断】
+
+        处理流程:
+        1. 全局屏蔽检查(黑白名单、权限)
+        2. 内置指令屏蔽
+        3. 检查是否已被其他插件处理
+        4. 唤醒条件判断(决定是否调用LLM)
         """
         # 提取基本信息
         chain = event.get_messages()
@@ -134,7 +116,7 @@ class WakeProPlugin(Star):
             return
         cmd = msg.split(" ", 1)[0]
 
-        # ========== 第一层：全局屏蔽检查（对所有消息生效）==========
+        # ========== 1. 全局屏蔽检查(快速失败) ==========
         
         # 过滤 bot 自己的消息
         if uid == bid:
@@ -154,7 +136,7 @@ class WakeProPlugin(Star):
             event.stop_event()
             return
 
-        # ========== 第二层：内置指令屏蔽（只对内置指令生效）==========
+        # ========== 2. 内置指令屏蔽 ==========
         
         if self.conf["block_builtin"]:
             if not event.is_admin() and event.message_str in BUILT_CMDS:
@@ -162,55 +144,13 @@ class WakeProPlugin(Star):
                 event.stop_event()
                 return
         
-        # ========== 第三层：插件指令过滤（跳过所有插件指令）==========
-        
-        # 如果是任何插件的指令，直接放行，不做任何处理
-        if cmd in self.commands:
-            logger.debug(f"检测到插件指令({cmd})，跳过wakepro处理")
-            return
-        
-        # 手动配置的忽略指令（用于处理别名等无法自动识别的情况）
-        ignore_commands = self.conf.get("ignore_commands", [])
-        if cmd in ignore_commands:
-            logger.debug(f"检测到配置的忽略指令({cmd})，跳过wakepro处理")
-            return
-
-        # ========== 第四层：LLM对话相关处理 ==========
+        # ========== 3. 唤醒条件判断(决定是否标记为LLM请求) ==========
         
         # 初始化或获取用户状态
         if uid not in g.members:
             g.members[uid] = MemberState(uid=uid)
         member = g.members[uid]
         now = time.time()
-        
-        # 如果用户正在消息合并状态，跳过所有检查（由 session_waiter 处理）
-        if member.in_merging:
-            logger.debug(f"用户({uid})处于消息合并状态，进入session_waiter")
-            return
-
-        # --- 防护机制检查 ---
-        
-        # 群组闭嘴检查
-        if g.shutup_until > now:
-            event.stop_event()
-            return
-
-        # 沉默检查
-        if not event.is_admin() and member.silence_until > now:
-            event.stop_event()
-            return
-
-        # 请求CD检查：最高优先级，防止消息轰炸
-        request_cd_value = self.conf.get("request_cd", 0)
-        if request_cd_value > 0:
-            time_since_last_request = now - member.last_request
-            if time_since_last_request < request_cd_value:
-                logger.debug(
-                    f"用户({uid})处于请求CD中"
-                    f"({time_since_last_request:.1f}s < {request_cd_value}s)"
-                )
-                event.stop_event()
-                return
 
         # --- 唤醒条件判断 ---
         
@@ -271,57 +211,12 @@ class WakeProPlugin(Star):
                     event.stop_event()
                     return
 
-        # --- 触发唤醒 ---
+        # --- 标记唤醒状态 ---
         
         if wake:
             event.is_at_or_wake_command = True
             logger.info(f"群({gid})用户({uid}) {reason}：{msg[:50]}")
-            
-            # 记录请求时间（在即将发送请求前）
-            member.last_request = now
-            
-            # 消息合并处理
-            if self.conf["merge_delay"] and self.conf["merge_delay"] > 0:
-                if not member.in_merging:
-                    member.in_merging = True
-                    try:
-                        await self._handle_message_merge(event, gid, uid, member, now)
-                    finally:
-                        member.in_merging = False
-                else:
-                    logger.debug(f"用户({uid})已在消息合并状态，跳过")
-
-        # --- 沉默机制触发检测 ---
-        
-        # 闭嘴机制：针对整个群组
-        if self.conf["shutup"]:
-            shut_th = self.sent.shut(msg)
-            if shut_th > self.conf["shutup"]:
-                silence_sec = shut_th * self.conf["silence_multiple"]
-                g.shutup_until = now + silence_sec
-                logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
-                event.stop_event()
-                return
-
-        # 辱骂沉默机制：针对单个用户
-        if self.conf["insult"]:
-            insult_th = self.sent.insult(msg)
-            if insult_th > self.conf["insult"]:
-                silence_sec = insult_th * self.conf["silence_multiple"]
-                member.silence_until = now + silence_sec
-                logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒")
-                # 注意：本轮对话不沉默，允许bot回怼
-                return
-
-        # AI检测沉默机制：针对单个用户
-        if self.conf["ai"]:
-            ai_th = self.sent.is_ai(msg)
-            if ai_th > self.conf["ai"]:
-                silence_sec = ai_th * self.conf["silence_multiple"]
-                member.silence_until = now + silence_sec
-                logger.info(f"用户({uid})触发AI检测沉默{silence_sec:.1f}秒")
-                event.stop_event()
-                return
+            # 注意: 所有检测和防护都在第二层(on_llm_request)处理
 
     # ==================== 消息合并处理 ====================
     
@@ -402,6 +297,110 @@ class WakeProPlugin(Star):
                 )
             # 不 stop_event，让合并后的消息继续传递给 LLM
 
+    # ==================== 第二层: LLM请求级别钩子 ====================
+    
+    @filter.on_llm_request(priority=99)
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """
+        【第二层: LLM请求级别 - 深度防护】
+        
+        在真正发送LLM请求前执行:
+        1. 沉默触发检测(辱骂、闭嘴、AI检测)
+        2. 防护机制(沉默状态、闭嘴状态、请求CD)
+        3. 消息合并(短时间多条消息合并)
+        """
+        gid: str = event.get_group_id()
+        uid: str = event.get_sender_id()
+        
+        if not gid or not uid:
+            return
+        
+        g: GroupState = StateManager.get_group(gid)
+        if uid not in g.members:
+            g.members[uid] = MemberState(uid=uid)
+        
+        member = g.members[uid]
+        now = time.time()
+        msg = event.message_str
+        
+        # 如果用户正在消息合并状态，跳过检查(由 session_waiter 处理)
+        if member.in_merging:
+            logger.debug(f"用户({uid})处于消息合并状态，等待合并完成")
+            return
+
+        # ========== 1. 沉默触发检测 ==========
+        
+        # 闭嘴机制: 针对整个群组(立即生效)
+        if self.conf["shutup"]:
+            shut_th = self.sent.shut(msg)
+            if shut_th > self.conf["shutup"]:
+                silence_sec = shut_th * self.conf["silence_multiple"]
+                g.shutup_until = now + silence_sec
+                logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
+                event.stop_event()
+                return
+
+        # 辱骂沉默机制: 针对单个用户(下次生效,本次允许bot回怼)
+        if self.conf["insult"]:
+            insult_th = self.sent.insult(msg)
+            if insult_th > self.conf["insult"]:
+                silence_sec = insult_th * self.conf["silence_multiple"]
+                member.silence_until = now + silence_sec
+                logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
+                # 不阻止本次对话，让bot回怼
+
+        # AI检测沉默机制: 针对单个用户(立即生效)
+        if self.conf["ai"]:
+            ai_th = self.sent.is_ai(msg)
+            if ai_th > self.conf["ai"]:
+                silence_sec = ai_th * self.conf["silence_multiple"]
+                member.silence_until = now + silence_sec
+                logger.info(f"用户({uid})触发AI检测沉默{silence_sec:.1f}秒")
+                event.stop_event()
+                return
+
+        # ========== 2. 防护机制检查 ==========
+        
+        # 群组闭嘴检查
+        if g.shutup_until > now:
+            logger.debug(f"群({gid})处于闭嘴状态，阻止LLM请求")
+            event.stop_event()
+            return
+
+        # 沉默检查
+        if not event.is_admin() and member.silence_until > now:
+            logger.debug(f"用户({uid})处于沉默状态，阻止LLM请求")
+            event.stop_event()
+            return
+
+        # 请求CD检查: 防止消息轰炸
+        request_cd_value = self.conf.get("request_cd", 0)
+        if request_cd_value > 0:
+            time_since_last_request = now - member.last_request
+            if time_since_last_request < request_cd_value:
+                logger.debug(
+                    f"用户({uid})处于请求CD中"
+                    f"({time_since_last_request:.1f}s < {request_cd_value}s)"
+                )
+                event.stop_event()
+                return
+        
+        # 记录请求时间
+        member.last_request = now
+        
+        # ========== 3. 消息合并处理 ==========
+        
+        # 消息合并: 等待短时间内的后续消息
+        if self.conf["merge_delay"] and self.conf["merge_delay"] > 0:
+            if not member.in_merging:
+                member.in_merging = True
+                try:
+                    await self._handle_message_merge(event, gid, uid, member, now)
+                finally:
+                    member.in_merging = False
+            else:
+                logger.debug(f"用户({uid})已在消息合并状态，跳过")
+    
     # ==================== 事件钩子 ====================
     
     @filter.on_llm_response(priority=20)
